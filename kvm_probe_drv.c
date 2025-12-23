@@ -679,13 +679,13 @@ static inline unsigned long apply_kaslr(unsigned long unslid_addr)
 static unsigned long disable_wp(void)
 {
     unsigned long cr0 = native_read_cr0();
-    native_write_cr0(cr0 & ~(1UL << 16));  /* Clear WP bit */
+    asm volatile("mov %0, %%cr0" : : "r"(cr0 & ~(1UL << 16)) : "memory");  /* Clear WP bit */
     return cr0;
 }
 
 static void restore_wp(unsigned long cr0)
 {
-    native_write_cr0(cr0);
+    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
 }
 
 /* Disable SMEP/SMAP temporarily */
@@ -1239,7 +1239,7 @@ static int write_cr_register(int cr_num, unsigned long value, unsigned long mask
         case 0:
             current_val = native_read_cr0();
             new_val = (current_val & ~mask) | (value & mask);
-            native_write_cr0(new_val);
+            asm volatile("mov %0, %%cr0" : : "r"(new_val) : "memory");
             printk(KERN_INFO "%s: CR0: 0x%lx -> 0x%lx\n", 
                    DRIVER_NAME, current_val, new_val);
             break;
@@ -1254,7 +1254,7 @@ static int write_cr_register(int cr_num, unsigned long value, unsigned long mask
         case 4:
             current_val = native_read_cr4();
             new_val = (current_val & ~mask) | (value & mask);
-            native_write_cr4(new_val);
+            asm volatile("mov %0, %%cr4" : : "r"(new_val) : "memory");
             printk(KERN_INFO "%s: CR4: 0x%lx -> 0x%lx\n",
                    DRIVER_NAME, current_val, new_val);
             break;
@@ -2583,6 +2583,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
         }
 
+        /*
         case IOCTL_HVA_TO_PFN: {
             struct hva_to_pfn_request req;
 
@@ -2594,6 +2595,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
         }
+        */
 
         case IOCTL_PFN_TO_HVA: {
             struct addr_conv_request req;
