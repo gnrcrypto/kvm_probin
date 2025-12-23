@@ -975,6 +975,7 @@ static int find_pattern_in_range(unsigned long start, unsigned long end,
 }
 
 #ifdef CONFIG_X86
+/*
 /* Dump page table entries for a virtual address */
 static int dump_page_tables(unsigned long virt_addr, struct page_table_dump *dump)
 {
