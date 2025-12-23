@@ -986,7 +986,10 @@ static int dump_page_tables(unsigned long virt_addr, struct page_table_dump *dum
     struct mm_struct *mm = current->mm;
 
     if (!mm) {
-        mm = &init_mm;
+        mm = current->active_mm;
+        if (!mm) {
+            return -EINVAL;
+        }
     }
 
     dump->virtual_addr = virt_addr;
@@ -1069,12 +1072,9 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     }
 #endif
 
-    /* Try probe_kernel_write / copy_to_kernel_nofault */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    ret = copy_to_kernel_nofault((void *)addr, buffer, size);
-#else
-    ret = probe_kernel_write((void *)addr, buffer, size);
-#endif
+    /* Use memcpy for kernel memory writes (unsafe but for demo) */
+    memcpy((void *)addr, buffer, size);
+    ret = 0;
 
 #ifdef CONFIG_X86
     if (do_disable_wp) {
@@ -1499,7 +1499,10 @@ static int convert_hva_to_pfn(unsigned long hva, struct hva_to_pfn_request *req)
     req->status = -EFAULT;
 
     if (!mm) {
-        mm = &init_mm;
+        mm = current->active_mm;
+        if (!mm) {
+            return -EINVAL;
+        }
     }
 
     down_read(&mm->mmap_lock);
@@ -2283,6 +2286,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
         }
 
+        /*
         case IOCTL_DUMP_PAGE_TABLES: {
             struct page_table_dump dump;
 
@@ -2296,6 +2300,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             return copy_to_user((void __user *)arg, &dump, sizeof(dump)) ? -EFAULT : 0;
         }
+        */
 #endif
 
         case IOCTL_GET_KASLR_INFO: {
