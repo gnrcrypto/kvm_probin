@@ -9,7 +9,7 @@ KBUILD_CFLAGS += -Wno-error
 
 # Userspace tool
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g
+CFLAGS = -Wno-error -O2 -g
 
 .PHONY: all module userspace clean install uninstall help
 
