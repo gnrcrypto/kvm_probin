@@ -5,6 +5,7 @@
 obj-m += kvm_probe_drv.o
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
+KBUILD_CFLAGS += -Wno-error
 
 # Userspace tool
 CC = gcc
