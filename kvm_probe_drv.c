@@ -674,61 +674,6 @@ static inline unsigned long apply_kaslr(unsigned long unslid_addr)
  * ======================================================================== */
 
 #ifdef CONFIG_X86
-static inline unsigned long native_read_cr0(void)
-{
-    unsigned long val;
-    asm volatile("mov %%cr0, %0" : "=r"(val));
-    return val;
-}
-
-static inline void native_write_cr0(unsigned long val)
-{
-    asm volatile("mov %0, %%cr0" : : "r"(val) : "memory");
-}
-
-static inline unsigned long native_read_cr2(void)
-{
-    unsigned long val;
-    asm volatile("mov %%cr2, %0" : "=r"(val));
-    return val;
-}
-
-static inline unsigned long native_read_cr3(void)
-{
-    unsigned long val;
-    asm volatile("mov %%cr3, %0" : "=r"(val));
-    return val;
-}
-
-static inline unsigned long native_read_cr4(void)
-{
-    unsigned long val;
-    asm volatile("mov %%cr4, %0" : "=r"(val));
-    return val;
-}
-
-static inline void native_write_cr4(unsigned long val)
-{
-    asm volatile("mov %0, %%cr4" : : "r"(val) : "memory");
-}
-
-static unsigned long read_cr_register(int cr_num)
-{
-    switch (cr_num) {
-        case 0: return native_read_cr0();
-        case 2: return native_read_cr2();
-        case 3: return native_read_cr3();
-        case 4: return native_read_cr4();
-        default: return 0;
-    }
-}
-
-static u64 native_read_msr(u32 msr)
-{
-    u32 low, high;
-    asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
-    return ((u64)high << 32) | low;
-}
 
 /* Disable write protection for kernel memory access */
 static unsigned long disable_wp(void)
@@ -772,6 +717,24 @@ static inline bool is_kernel_address(unsigned long addr)
 static inline bool is_valid_phys_addr(unsigned long phys_addr)
 {
     return phys_addr < max_pfn << PAGE_SHIFT;
+}
+
+static inline unsigned long native_read_cr3(void)
+{
+    unsigned long val;
+    asm volatile("mov %%cr3, %0" : "=r"(val));
+    return val;
+}
+
+static unsigned long read_cr_register(int cr_num)
+{
+    switch (cr_num) {
+        case 0: return native_read_cr0();
+        case 2: return native_read_cr2();
+        case 3: return native_read_cr3();
+        case 4: return native_read_cr4();
+        default: return 0;
+    }
 }
 
 /* Read kernel memory using probe_kernel_read or direct copy */
@@ -1088,7 +1051,7 @@ static int dump_page_tables(unsigned long virt_addr, struct page_table_dump *dum
 
 /* Write to kernel memory - handles write protection bypass */
 static int write_kernel_memory(unsigned long addr, const unsigned char *buffer, 
-                                size_t size, int disable_wp)
+                                size_t size, int do_disable_wp)
 {
     unsigned long orig_cr0 = 0;
     int ret = 0;
@@ -1100,7 +1063,7 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     }
 
 #ifdef CONFIG_X86
-    if (disable_wp) {
+    if (do_disable_wp) {
         /* Disable write protection */
         orig_cr0 = disable_wp();
     }
@@ -1114,7 +1077,7 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
 #endif
 
 #ifdef CONFIG_X86
-    if (disable_wp) {
+    if (do_disable_wp) {
         /* Restore write protection */
         restore_wp(orig_cr0);
     }

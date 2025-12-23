@@ -21,9 +21,9 @@ module:
 userspace: probe
 	@echo "[+] Userspace tool built"
 
-probe: probe.c
+probe: kvm_prober.c
 	@echo "[*] Building userspace tool..."
-	$(CC) $(CFLAGS) -o probe probe.c
+	$(CC) $(CFLAGS) -o probe kvm_prober.c
 
 clean:
 	@echo "[*] Cleaning..."
