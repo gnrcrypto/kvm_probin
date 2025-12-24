@@ -54,7 +54,14 @@ sleep 2
 echo "[*] Installing necessary headers..."
 dpkg -i *.deb || true
 
+echo "[*] Building + Installing the Prober..."
+bash make
 
+export TERM=XTERM
+clear
+dmesg -c
+sleep 5
+clear
 
 sleep 2
 echo "[*] host VA and PA addresses"
@@ -64,5 +71,5 @@ echo "Read flag address:  0xffffffff82b5ee10    0x695ee10"
 sleep 5
 echo "[*] Write flags default value"
 echo "deadbeef41424344"
-echo "with little endian: 44434241efbeadde
+echo "with little endian: 44434241efbeadde"
 
