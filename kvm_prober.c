@@ -352,17 +352,30 @@ void get_symbol_count(void) {
 
 void list_symbols(int max_count) {
     unsigned int count;
-    if (ioctl(fd, IOCTL_GET_SYMBOL_COUNT, &count) < 0) return;
+    if (ioctl(fd, IOCTL_GET_SYMBOL_COUNT, &count) < 0) {
+        perror("[-] get_symbol_count failed");
+        return;
+    }
+    
     if (max_count > 0 && (unsigned)max_count < count) count = max_count;
     
     printf("[+] Listing %u symbols:\n", count);
     for (unsigned int i = 0; i < count; i++) {
         struct symbol_request req = {0};
         unsigned int idx = i;
-        if (ioctl(fd, IOCTL_GET_SYMBOL_BY_INDEX, &idx) >= 0 &&
-            ioctl(fd, IOCTL_GET_SYMBOL_BY_INDEX, &req) >= 0) {
+        
+        /* First set the index */
+        if (ioctl(fd, IOCTL_GET_SYMBOL_BY_INDEX, &idx) < 0) {
+            perror("[-] Failed to set symbol index");
+            continue;
+        }
+        
+        /* Then get the symbol */
+        if (ioctl(fd, IOCTL_GET_SYMBOL_BY_INDEX, &req) >= 0) {
             printf("  [%u] %-40s 0x%lx  %s\n", i, req.name, req.address, req.description);
-            }
+        } else {
+            printf("  [%u] Failed to get symbol\n", i);
+        }
     }
 }
 
@@ -1149,22 +1162,19 @@ void scan_memory(unsigned long start, unsigned long end, unsigned long step,
                                       }
                                   }
                                   
-                                  void scan_for_exploit_patterns(unsigned long start, unsigned long end) {
-                                      const char *patterns[] = {
-                                          "ffffffff81",  /* Kernel text pointer prefix */
-                                          "ffff888",     /* Direct map prefix */
-                                          "deadbeef",    /* Debug marker */
-                                          "41414141",    /* AAAA */
-                                          "554889e5",    /* push rbp; mov rbp,rsp */
-                                          NULL
-                                      };
-                                      
-                                      printf("[+] Scanning for exploit patterns in 0x%lx-0x%lx\n", start, end);
-                                      for (int i = 0; patterns[i]; i++) {
-                                          printf("  Pattern: %s\n", patterns[i]);
-                                          find_pattern(start, end, patterns[i]);
-                                      }
-                                  }
+                                    void scan_for_exploit_patterns(unsigned long start, unsigned long end) {
+                                        const char *patterns[] = {
+                                            "44434241efbeadde", /* complete write_flag */
+                                            NULL
+                                        };
+                                        
+                                        printf("[+] Scanning for exploit patterns in 0x%lx-0x%lx\n", start, end);
+                                        for (int i = 0; patterns[i]; i++) {
+                                            printf("  Pattern: %s\n", patterns[i]);
+                                            /* Note: find_pattern expects hex string without spaces */
+                                            find_pattern(start, end, patterns[i]);
+                                        }
+                                    }
                                   
                                   void print_help(void) {
                                       printf("╔══════════════════════════════════════════════════════════════════════════╗\n");
@@ -1256,6 +1266,38 @@ void scan_memory(unsigned long start, unsigned long end, unsigned long step,
                                       else if (strcmp(cmd, "vmx") == 0) analyze_vmx_handlers();
                                       else if (strcmp(cmd, "svm") == 0) analyze_svm_handlers();
                                       
+                                      /* Address conversion operations */
+                                      else if (strcmp(cmd, "v2p") == 0 && argc > 2)
+                                          convert_virt_to_phys(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "p2v") == 0 && argc > 2)
+                                          convert_phys_to_virt(strtoul(argv[2], NULL, 0), argc > 3 ? atoi(argv[3]) : 0);
+                                      else if (strcmp(cmd, "hva2pfn") == 0 && argc > 2)
+                                          convert_hva_to_pfn(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "pfn2hva") == 0 && argc > 2)
+                                          convert_pfn_to_hva(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "gpa2gfn") == 0 && argc > 2)
+                                          convert_gpa_to_gfn(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "gfn2gpa") == 0 && argc > 2)
+                                          convert_gfn_to_gpa(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "gpa2hva") == 0 && argc > 2)
+                                          convert_gpa_to_hva(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "gfn2hva") == 0 && argc > 2)
+                                          convert_gfn_to_hva(strtoul(argv[2], NULL, 0));
+                                     else if (strcmp(cmd, "gfn2pfn") == 0 && argc > 2)
+                                          convert_gfn_to_pfn(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "hva2gfn") == 0 && argc > 2)
+                                          convert_hva_to_gfn(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "v2pfn") == 0 && argc > 2)
+                                          convert_virt_to_pfn(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "spte") == 0 && argc > 2)
+                                          decode_spte(strtoul(argv[2], NULL, 0));
+                                      else if (strcmp(cmd, "ept_walk") == 0 && argc > 3)
+                                          walk_ept(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+                                      else if (strcmp(cmd, "gva2gpa") == 0 && argc > 3)
+                                          translate_gva(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+                                      else if (strcmp(cmd, "addrinfo") == 0 && argc > 2)
+                                          show_addr_info(strtoul(argv[2], NULL, 0));
+    
                                       /* Memory read operations */
                                       else if (strcmp(cmd, "read_kernel") == 0 && argc > 3) 
                                           read_kernel_mem(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
