@@ -71,8 +71,12 @@ make KCFLAGS="-Wno-error"
 make KCFLAGS="-Wno-error" install
 make kvm_prober
 make hyperdump
+make ahci_exploit
+make ahci_dma
 cp kvm_prober /bin
 cp hyperdump /bin
+cp ahci_exploit /bin
+cp ahci_dma /bin
 sleep 5
 
 echo "[*] running exploit now..."
