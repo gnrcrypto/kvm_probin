@@ -1,5 +1,9 @@
 #!/bin/bash
 
+echo "[*] unbinding ahci driver"
+echo "0000:00:1f.2" > /sys/bus/pci/drivers/ahci/unbind
+sleep 5
+
 echo "[*] clearing dmesg"
 dmesg -c
 
