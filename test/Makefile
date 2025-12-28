@@ -24,7 +24,7 @@ userspace: probe
 
 probe: kvm_prober.c
 	@echo "[*] Building userspace tool..."
-	$(CC) $(CFLAGS) -o probe kvm_prober.c
+	$(CC) $(CFLAGS) -o probe probe.c
 
 clean:
 	@echo "[*] Cleaning..."
