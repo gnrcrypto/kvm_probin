@@ -743,25 +743,26 @@ static inline bool is_valid_phys_addr(unsigned long phys_addr)
     return phys_addr < max_pfn << PAGE_SHIFT;
 }
 
-/* Read kernel memory using probe_kernel_read or direct copy */
+/* Read kernel memory using direct copy */
 static int read_kernel_memory(unsigned long addr, unsigned char *buffer, size_t size)
 {
+    int i;
+
     if (!is_kernel_address(addr)) {
         printk(KERN_DEBUG "%s: Invalid kernel address: 0x%lx\n", DRIVER_NAME, addr);
         return -EINVAL;
     }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    /* Use copy_from_kernel_nofault for newer kernels */
-    if (copy_from_kernel_nofault(buffer, (void *)addr, size)) {
-        return -EFAULT;
+    /* Direct memory read with interrupts disabled for safety */
+    preempt_disable();
+    barrier();
+    
+    for (i = 0; i < size; i++) {
+        buffer[i] = *((unsigned char *)addr + i);
     }
-#else
-    /* Use probe_kernel_read for older kernels */
-    if (probe_kernel_read(buffer, (void *)addr, size)) {
-        return -EFAULT;
-    }
-#endif
+    
+    barrier();
+    preempt_enable();
 
     return 0;
 }
@@ -1058,7 +1059,7 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
                                 size_t size, int disable_wp_flag)
 {
     unsigned long orig_cr0 = 0;
-    int ret = 0;
+    int i;
 
     if (!is_kernel_address(addr)) {
         printk(KERN_DEBUG "%s: Invalid kernel address for write: 0x%lx\n", 
@@ -1067,38 +1068,35 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     }
 
 #ifdef CONFIG_X86
-    if (disable_wp) {
+    if (disable_wp_flag) {
         /* Disable write protection */
         orig_cr0 = disable_wp();
     }
 #endif
 
-    /* Try probe_kernel_write / copy_to_kernel_nofault */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    ret = copy_to_kernel_nofault((void *)addr, buffer, size);
-#else
-    ret = probe_kernel_write((void *)addr, buffer, size);
-#endif
+    /* Direct memory write with interrupts disabled for safety */
+    preempt_disable();
+    barrier();
+    
+    for (i = 0; i < size; i++) {
+        *((unsigned char *)addr + i) = buffer[i];
+    }
+    
+    barrier();
+    preempt_enable();
 
 #ifdef CONFIG_X86
-    if (disable_wp) {
+    if (disable_wp_flag) {
         /* Restore write protection */
         restore_wp(orig_cr0);
     }
 #endif
-
-    if (ret) {
-        printk(KERN_DEBUG "%s: write_kernel_memory failed at 0x%lx\n", 
-               DRIVER_NAME, addr);
-        return -EFAULT;
-    }
 
     printk(KERN_INFO "%s: Wrote %zu bytes to kernel address 0x%lx\n",
            DRIVER_NAME, size, addr);
 
     return 0;
 }
-
 /* Write to physical memory using ioremap */
 static int write_physical_memory(unsigned long phys_addr, const unsigned char *buffer, 
                                   size_t size)
@@ -1475,7 +1473,7 @@ static int convert_hva_to_pfn(unsigned long hva, struct hva_to_pfn_request *req)
         int ret;
         
         mmap_read_lock(current->mm);
-        ret = get_user_pages(hva, 1, 0, &page);
+        ret = get_user_pages(hva, 1, 0, &page, NULL);
         mmap_read_unlock(current->mm);
         
         if (ret == 1) {
@@ -2854,4 +2852,3 @@ static void __exit mod_exit(void)
 
 module_init(mod_init);
 module_exit(mod_exit);
-
